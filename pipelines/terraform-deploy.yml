@@ -1,0 +1,78 @@
+name: Terraform Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      rg_folder:
+        description: 'Path to the RG folder in ResourceInputFile repo'
+        required: true
+        type: string
+      action:
+        description: 'Terraform action: plan or apply'
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+      request_id:
+        description: 'Request ID for tracking'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: Terraform ${{ inputs.action }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.rg_folder }}
+
+    steps:
+      - name: Checkout ResourceInputFile
+        uses: actions/checkout@v4
+        with:
+          repository: robinan11/ResourceInputFile
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Terraform Init
+        run: terraform init
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Terraform Plan
+        if: inputs.action == 'plan'
+        id: plan
+        run: |
+          terraform plan -var-file=terraform.tfvars -no-color -out=tfplan 2>&1 | tee plan_output.txt
+          echo "plan_output<<EOF" >> $GITHUB_OUTPUT
+          cat plan_output.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Terraform Apply
+        if: inputs.action == 'apply'
+        run: terraform apply -var-file=terraform.tfvars -auto-approve -no-color
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Post result
+        if: always()
+        run: echo "Request ID ${{ inputs.request_id }} — ${{ inputs.action }} completed with status ${{ job.status }}"
