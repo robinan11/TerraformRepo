@@ -18,6 +18,10 @@ on:
         description: 'Request ID for tracking'
         required: true
         type: string
+      callback_url:
+        description: 'Backend callback URL to post plan output'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -54,15 +58,29 @@ jobs:
         if: inputs.action == 'plan'
         id: plan
         run: |
+          set +e
           terraform plan -var-file=terraform.tfvars -no-color -out=tfplan 2>&1 | tee plan_output.txt
-          echo "plan_output<<EOF" >> $GITHUB_OUTPUT
-          cat plan_output.txt >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          echo "plan_exitcode=$?" >> $GITHUB_ENV
         env:
           ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
           ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
           ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
           ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Post plan output to backend
+        if: inputs.action == 'plan' && inputs.callback_url != ''
+        run: |
+          PLAN_OUTPUT=$(cat plan_output.txt 2>/dev/null || echo "Plan output not available")
+          curl -sf -X POST "${{ inputs.callback_url }}" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: ${{ secrets.PLAN_CALLBACK_SECRET }}" \
+            -d "$(jq -n \
+              --arg request_id "${{ inputs.request_id }}" \
+              --arg plan_output "$PLAN_OUTPUT" \
+              --arg status "success" \
+              --arg exit_code "${{ env.plan_exitcode }}" \
+              '{request_id: $request_id, plan_output: $plan_output, status: $status, exit_code: $exit_code}')"
+          echo "Plan output posted to callback URL"
 
       - name: Terraform Apply
         if: inputs.action == 'apply'
@@ -73,6 +91,21 @@ jobs:
           ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
           ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
 
-      - name: Post result
+      - name: Post failure to backend
+        if: failure() && inputs.callback_url != ''
+        run: |
+          PLAN_OUTPUT=$(cat plan_output.txt 2>/dev/null || echo "Terraform failed before producing output")
+          curl -sf -X POST "${{ inputs.callback_url }}" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: ${{ secrets.PLAN_CALLBACK_SECRET }}" \
+            -d "$(jq -n \
+              --arg request_id "${{ inputs.request_id }}" \
+              --arg plan_output "$PLAN_OUTPUT" \
+              --arg status "failed" \
+              --arg exit_code "1" \
+              '{request_id: $request_id, plan_output: $plan_output, status: $status, exit_code: $exit_code}')"
+          echo "Failure posted to callback URL"
+
+      - name: Summary
         if: always()
-        run: echo "Request ID ${{ inputs.request_id }} — ${{ inputs.action }} completed with status ${{ job.status }}"
+        run: echo "Request ${{ inputs.request_id }} — ${{ inputs.action }} completed with status ${{ job.status }}"
