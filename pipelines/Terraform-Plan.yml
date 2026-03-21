@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: robinan11/ResourceInputFile
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.REPO_PAT }}
 
       # ── Install Terraform ──
       - name: Setup Terraform
