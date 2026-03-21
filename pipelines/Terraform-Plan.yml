@@ -1,113 +1,77 @@
-name: Terraform Plan
+name: Terraform Deploy
 
 on:
   workflow_dispatch:
     inputs:
       rg_folder:
-        description: "Path to the RG folder in ResourceInputFile repo (e.g. rg-myapp-01)"
+        description: 'Path to the RG folder in ResourceInputFile repo'
         required: true
         type: string
+      action:
+        description: 'Terraform action: plan or apply'
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
       request_id:
-        description: "Portal request ID for tracking"
+        description: 'Request ID for tracking'
         required: true
         type: string
       callback_url:
-        description: "Backend callback URL to post plan output"
+        description: 'Backend callback URL to post plan output'
         required: false
         type: string
 
 permissions:
   contents: read
 
-env:
-  TF_IN_AUTOMATION: "true"
-
 jobs:
-  plan:
-    name: Terraform Init & Plan
+  terraform:
+    name: Terraform ${{ inputs.action }}
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ${{ inputs.rg_folder }}
 
     steps:
-      # ── Checkout the repo that holds the generated .tf files ──
       - name: Checkout ResourceInputFile
         uses: actions/checkout@v4
         with:
           repository: robinan11/ResourceInputFile
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Install Terraform ──
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.0"
-          terraform_wrapper: false        # raw exit codes, no wrapper noise
 
-      # ── Terraform Init ──
       - name: Terraform Init
-        id: init
-        run: terraform init -input=false
+        run: terraform init
         env:
-          ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
-          ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
-          ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
           ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
 
-      # ── Terraform Validate ──
-      - name: Terraform Validate
-        id: validate
-        run: terraform validate -no-color
-
-      # ── Terraform Plan ──
       - name: Terraform Plan
+        if: inputs.action == 'plan'
         id: plan
         run: |
           set +e
-          terraform plan -var-file=terraform.tfvars -no-color -detailed-exitcode -out=tfplan 2>&1 | tee plan_output.txt
-          EXITCODE=$?
-          echo "plan_exitcode=$EXITCODE" >> "$GITHUB_ENV"
-
-          # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes present
-          if [ "$EXITCODE" -eq 1 ]; then
-            echo "plan_status=error" >> "$GITHUB_ENV"
-          elif [ "$EXITCODE" -eq 2 ]; then
-            echo "plan_status=changes" >> "$GITHUB_ENV"
-          else
-            echo "plan_status=no_changes" >> "$GITHUB_ENV"
-          fi
+          terraform plan -var-file=terraform.tfvars -no-color -out=tfplan 2>&1 | tee plan_output.txt
+          echo "plan_exitcode=$?" >> $GITHUB_ENV
         env:
-          ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
-          ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
-          ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
           ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
 
-      # ── Write plan summary to GitHub Actions job summary ──
-      - name: Plan Summary
-        if: always()
-        run: |
-          echo "### Terraform Plan Report" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Item | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Request ID** | \`${{ inputs.request_id }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Folder** | \`${{ inputs.rg_folder }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Plan Status** | \`${{ env.plan_status }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Exit Code** | \`${{ env.plan_exitcode }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "<details><summary>Full Plan Output</summary>" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat plan_output.txt 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || echo "No plan output captured" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
-
-      # ── Post plan output back to the portal backend ──
       - name: Post plan output to backend
-        if: inputs.callback_url != ''
+        if: inputs.action == 'plan' && inputs.callback_url != ''
         run: |
-          PLAN_OUTPUT=$(cat plan_output.txt 2>/dev/null | head -c 50000 || echo "Plan output not available")
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${{ inputs.callback_url }}" \
+          PLAN_OUTPUT=$(cat plan_output.txt 2>/dev/null || echo "Plan output not available")
+          curl -sf -X POST "${{ inputs.callback_url }}" \
             -H "Content-Type: application/json" \
             -H "X-Webhook-Secret: ${{ secrets.PLAN_CALLBACK_SECRET }}" \
             -d "$(jq -n \
@@ -115,13 +79,18 @@ jobs:
               --arg plan_output "$PLAN_OUTPUT" \
               --arg status "success" \
               --arg exit_code "${{ env.plan_exitcode }}" \
-              '{request_id: $request_id, plan_output: $plan_output, status: $status, exit_code: $exit_code}')")
-          echo "Callback response: HTTP $HTTP_CODE"
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "::warning::Callback POST returned HTTP $HTTP_CODE"
-          fi
+              '{request_id: $request_id, plan_output: $plan_output, status: $status, exit_code: $exit_code}')"
+          echo "Plan output posted to callback URL"
 
-      # ── Post failure if earlier steps crashed ──
+      - name: Terraform Apply
+        if: inputs.action == 'apply'
+        run: terraform apply -var-file=terraform.tfvars -auto-approve -no-color
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
       - name: Post failure to backend
         if: failure() && inputs.callback_url != ''
         run: |
@@ -135,4 +104,8 @@ jobs:
               --arg status "failed" \
               --arg exit_code "1" \
               '{request_id: $request_id, plan_output: $plan_output, status: $status, exit_code: $exit_code}')"
-          echo "Failure posted to callback"
+          echo "Failure posted to callback URL"
+
+      - name: Summary
+        if: always()
+        run: echo "Request ${{ inputs.request_id }} — ${{ inputs.action }} completed with status ${{ job.status }}"
