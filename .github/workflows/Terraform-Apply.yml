@@ -1,0 +1,89 @@
+name: Terraform Apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      rg_folder:
+        description: 'Path to the RG folder in ResourceInputFile repo'
+        required: true
+        type: string
+      request_id:
+        description: 'Request ID for tracking'
+        required: true
+        type: string
+      callback_url:
+        description: 'Backend callback URL to post apply result'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.rg_folder }}
+
+    steps:
+      - name: Checkout ResourceInputFile
+        uses: actions/checkout@v4
+        with:
+          repository: robinan11/ResourceInputFile
+          token: ${{ secrets.REPO_PAT }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Terraform Init
+        run: terraform init
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Terraform Apply
+        id: apply
+        run: |
+          set +e
+          terraform apply -var-file=terraform.tfvars -auto-approve -no-color 2>&1 | tee apply_output.txt
+          echo "apply_exitcode=$?" >> $GITHUB_ENV
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Post apply result to backend
+        if: always()
+        env:
+          PLAN_CALLBACK_SECRET: ${{ secrets.PLAN_CALLBACK_SECRET }}
+        run: |
+          APPLY_OUTPUT=$(cat apply_output.txt 2>/dev/null || echo "Apply output not available")
+          if [ "${{ env.apply_exitcode }}" = "0" ]; then
+            STATUS="success"
+          else
+            STATUS="failed"
+          fi
+          BODY=$(jq -n \
+            --arg request_id "${{ inputs.request_id }}" \
+            --arg apply_output "$APPLY_OUTPUT" \
+            --arg status "$STATUS" \
+            --arg exit_code "${{ env.apply_exitcode }}" \
+            '{request_id: $request_id, apply_output: $apply_output, status: $status, exit_code: $exit_code}')
+          SIGNATURE=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$PLAN_CALLBACK_SECRET" | awk -F= '{print $NF}' | tr -d ' ')
+          curl --retry 3 --retry-delay 5 -sf -X POST "${{ inputs.callback_url }}" \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: sha256=$SIGNATURE" \
+            -H "X-Webhook-Secret: $PLAN_CALLBACK_SECRET" \
+            -d "$BODY"
+          echo "Apply result posted to callback URL"
+
+      - name: Summary
+        if: always()
+        run: echo "Request ${{ inputs.request_id }} — terraform apply completed with exit code ${{ env.apply_exitcode }}"
